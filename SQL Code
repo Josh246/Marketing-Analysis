@@ -1,0 +1,114 @@
+WITH
+main AS (
+SELECT
+FORMAT_DATE('%A', PARSE_DATE('%Y%m%d', event_date)) AS event_day,
+ROW_NUMBER() OVER(PARTITION BY user_pseudo_id, event_date ORDER BY event_timestamp) AS row_num,
+PARSE_DATE('%Y%m%d', event_date) AS event_date,
+TIMESTAMP_MICROS(event_timestamp) AS event_timestamp,
+user_pseudo_id,
+event_value_in_usd,
+category,
+country,
+campaign
+FROM
+`tc-da-1.turing_data_analytics.raw_events` AS re
+ORDER BY
+re.user_pseudo_id
+),
+
+min_max_events AS (
+SELECT
+user_pseudo_id,
+event_date,
+MIN(row_num) AS min_row_num,
+MAX(row_num) AS max_row_num
+FROM
+main
+GROUP BY
+user_pseudo_id,
+event_date
+),
+
+times AS (
+SELECT
+m.event_day,
+m.user_pseudo_id,
+m.event_date,
+SUM(CASE WHEN m.event_value_in_usd IS NOT NULL THEN 1 END) AS purchase_count,
+SUM(m.event_value_in_usd) AS value_spent,
+MAX(CASE WHEN m.row_num = mme.min_row_num THEN m.event_timestamp END) AS start,
+MAX(CASE WHEN m.row_num = mme.max_row_num THEN m.event_timestamp END) AS finish
+FROM
+main AS m
+JOIN
+min_max_events AS mme
+ON
+m.user_pseudo_id = mme.user_pseudo_id
+AND (m.row_num = mme.min_row_num
+OR m.row_num = mme.max_row_num)
+GROUP BY
+m.event_day,
+m.user_pseudo_id,
+m.event_date
+ORDER BY
+m.user_pseudo_id
+),
+
+campaigns AS (
+SELECT
+Month,
+MIN(Campaign) as campaign,
+SUM(Impressions) AS impressions_total,
+SUM(Clicks) AS clicks_total,
+SUM(Cost) AS cost_total,
+PARSE_DATE('%Y%m', CAST(Month AS STRING)) AS Year
+FROM
+`tc-da-1.turing_data_analytics.adsense_monthly`
+WHERE
+Campaign NOT IN ('Data Share Promo')
+GROUP BY
+Month
+),
+
+metrics AS (
+SELECT
+t.user_pseudo_id,
+t.event_date,
+t.purchase_count,
+t.value_spent,
+TIMESTAMP_DIFF(finish, start, SECOND) AS diff_in_seconds,
+c.campaign,
+c.cost_total,
+c.cost_total/c.clicks_total AS cpc,
+c.cost_total/(c.impressions_total/1000) AS cpm,
+c.clicks_total/c.impressions_total AS ctr,
+FROM
+times AS t
+JOIN
+campaigns AS c
+ON
+EXTRACT(YEAR FROM t.event_date) = EXTRACT(YEAR FROM c.year)
+AND
+EXTRACT(MONTH FROM t.event_date) = EXTRACT(MONTH FROM c.year)
+)
+
+SELECT
+FORMAT_DATE('%A', event_date) AS event_day,
+campaign,
+COUNT(DISTINCT user_pseudo_id) AS user_count,
+COUNT(purchase_count) AS purchase_count,
+SUM(value_spent) AS value_spent,
+SUM(diff_in_seconds) AS time_spent,
+AVG(cpc) AS cpc_avg,
+AVG(cpm) AS cpm_avg,
+AVG(ctr) AS ctr_avg,
+STDDEV(value_spent)/AVG(value_spent) AS COV,
+MIN(cost_total)/COUNT(purchase_count) AS CPA,
+((SUM(value_spent) - MIN(cost_total))/MIN(cost_total)) * 100 AS ROI
+FROM
+metrics
+GROUP BY
+event_day,
+campaign
+ORDER BY
+campaign
